@@ -1,0 +1,434 @@
+from typing import Dict
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from collections import deque
+
+"""
+NOTE
+Add template_uec.team_algorithm.plotPerformance() to backtester to view graphs
+"""
+
+PRODUCT = "UEC_expanded"
+
+
+def compute_sortino_ratio(returns: np.ndarray, rf_rate=0.0):
+    """
+    Sortino ratio penalizes only negative volatility:
+      sortino = (mean(returns) - rf_rate) / stdev(negative returns)
+    """
+    if len(returns) < 2:
+        return 0.0
+    neg_rets = returns[returns < 0]
+    if len(neg_rets) == 0:
+        # no negative returns => infinite ratio if mean>0
+        return float('inf')
+    dr = np.std(neg_rets, ddof=1)
+    mean_excess = np.mean(returns) - rf_rate
+    if dr == 0:
+        return float('inf') if mean_excess > 0 else 0.0
+    return mean_excess / dr
+
+
+class TradingAlgorithm:
+    def __init__(
+        self,
+        high_spread_threshold: float = 1.35,
+        direction_wait_ticks: int = 130,
+        max_position: int = 100,
+        rolling_window: int = 50
+    ):
+        self.product = PRODUCT
+        self.high_spread_threshold = high_spread_threshold
+        self.direction_wait_ticks = direction_wait_ticks
+        self.max_position = max_position
+        self.rolling_window = rolling_window
+
+        self.cash = 0.0
+        self.fees = 0.002
+
+        self.positions: Dict[str, int] = {}
+        self.previousResults = {self.product: {'Timestamp': [], 'Bid': [], 'Ask': []}}
+        self.mid = {self.product: []}
+        self.spread = {self.product: []}
+
+        self.state = "FLAT"
+        self.last_high_spread_tick = None
+        self.eventAvg = None
+        self.current_tick = 0
+
+        # For PnL & plotting
+        self.pnl_history = []
+        self.timestamp_history = []
+        self.position_history = []
+        self.mid_history = []
+        self.order_signals = {self.product: []}
+
+        self.trade_history = []
+        self.active_trade = None
+
+        # Rolling average data
+        self.mid_deque = deque(maxlen=self.rolling_window)
+        self.sum_mid = 0.0
+
+    def getOrders(self, current_data: Dict[str, Dict[str, float]], order_data: Dict[str, int]) -> Dict[str, int]:
+        """Called each tick by the backtester. We'll only operate on 'UEC_expanded'."""
+        if self.product not in current_data:
+            return order_data
+
+        bid = current_data[self.product]['Bid']
+        ask = current_data[self.product]['Ask']
+        self.current_tick = current_data[self.product]['Timestamp']
+
+        self.addToStorage(bid, ask)
+
+        # Rolling average
+        mid_now = 0.5*(bid + ask)
+        currentAvg = self.updateRollingAvg(mid_now)
+
+        order_data[self.product] = 0
+
+        spread_now = ask - bid
+        pos_now = self.positions.get(self.product, 0)
+
+        # (A) If high spread => flatten => WAITING_DIRECTION
+        if spread_now > self.high_spread_threshold:
+            if self.state == "IN_POSITION":
+                qty_close = -pos_now
+                if qty_close != 0:
+                    order_data[self.product] = qty_close
+                    self._recordTrade(qty_close, ask if qty_close>0 else bid, 'close')
+            self.state = "WAITING_DIRECTION"
+            self.last_high_spread_tick = self.current_tick
+            self.eventAvg = currentAvg
+
+        # (B) If WAITING_DIRECTION => after direction_wait_ticks => compare rolling avg
+        if self.state == "WAITING_DIRECTION" and self.last_high_spread_tick is not None:
+            elapsed = self.current_tick - self.last_high_spread_tick
+            if elapsed >= self.direction_wait_ticks:
+                # Compare currentAvg vs. eventAvg
+                if currentAvg > self.eventAvg:
+                    # buy => up to +100
+                    target_pos = +self.max_position
+                    if pos_now < target_pos:
+                        qty = target_pos - pos_now
+                        if (pos_now + qty) > self.max_position:
+                            qty = self.max_position - pos_now
+                        order_data[self.product] = qty
+                        self._recordTrade(qty, ask, 'buy')
+                else:
+                    # sell => down to -100
+                    target_pos = -self.max_position
+                    if pos_now > target_pos:
+                        qty = target_pos - pos_now
+                        if (pos_now + qty) < -self.max_position:
+                            qty = -self.max_position - pos_now
+                        order_data[self.product] = qty
+                        self._recordTrade(qty, bid, 'sell')
+                self.state = "IN_POSITION"
+
+        return order_data
+
+    def addToStorage(self, bid: float, ask: float):
+        """Store raw data + approximate PnL (cash + pos*mid)."""
+        self.previousResults[self.product]['Timestamp'].append(self.current_tick)
+        self.previousResults[self.product]['Bid'].append(bid)
+        self.previousResults[self.product]['Ask'].append(ask)
+
+        mid_p = 0.5*(bid + ask)
+        self.mid[self.product].append(mid_p)
+        self.spread[self.product].append(ask - bid)
+        self.mid_history.append(mid_p)
+
+        pos_now = self.positions.get(self.product, 0)
+        eq = self.cash + pos_now*mid_p
+        self.pnl_history.append(eq)
+        self.timestamp_history.append(self.current_tick)
+        self.position_history.append(pos_now)
+
+    def updateRollingAvg(self, new_mid_price: float) -> float:
+        """Maintain a rolling average of last self.rolling_window mid prices in O(1)."""
+        if len(self.mid_deque) == self.rolling_window:
+            oldest = self.mid_deque[0]
+            self.sum_mid -= oldest
+        self.mid_deque.append(new_mid_price)
+        self.sum_mid += new_mid_price
+        return self.sum_mid / len(self.mid_deque)
+
+    def _recordTrade(self, quantity: int, price: float, signal_label: str):
+        """Track trade signals & round-trip PnL."""
+        old_pos = self.positions.get(self.product, 0)
+        new_pos = old_pos + quantity
+
+        self.order_signals[self.product].append((self.current_tick, signal_label))
+
+        if quantity > 0:
+            cost = price * quantity * (1 + self.fees)
+            self.cash -= cost
+        else:
+            proceeds = price * abs(quantity) * (1 - self.fees)
+            self.cash += proceeds
+
+        if old_pos == 0 and new_pos != 0:
+            # Opening
+            self.active_trade = {
+                'open_time': self.current_tick,
+                'open_price': price,
+                'size': new_pos
+            }
+        elif new_pos == 0 and old_pos != 0 and self.active_trade is not None:
+            # Closing
+            open_price = self.active_trade['open_price']
+            size = self.active_trade['size']
+            raw_pnl = (price - open_price)*size
+
+            # TODO Uncomment for debugging
+            # print(  f"TRADE COMPLETED: open_time={self.active_trade['open_time']}, "
+            #         f"close_time={self.current_tick}, "
+            #         f"open_price={open_price:.2f}, "
+            #         f"close_price={price:.2f}, "
+            #         f"size={size}, "
+            #         f"raw_pnl=({price:.2f}-{open_price:.2f})*{size}={raw_pnl:.2f}, "
+            #         f"signal={signal_label}")
+            
+            self.trade_history.append({
+                'open_time': self.active_trade['open_time'],
+                'close_time': self.current_tick,
+                'side': 'long' if size>0 else 'short',
+                'size': abs(size),
+                'open_price': open_price,
+                'close_price': price,
+                'pnl': raw_pnl
+            })
+            self.active_trade = None
+        elif np.sign(old_pos) != np.sign(new_pos):
+            # Reversal => close old, open new
+            if self.active_trade is not None:
+                open_price = self.active_trade['open_price']
+                size = self.active_trade['size']
+                raw_pnl = (price - open_price)*size
+                self.trade_history.append({
+                    'open_time': self.active_trade['open_time'],
+                    'close_time': self.current_tick,
+                    'side': 'long' if size>0 else 'short',
+                    'size': abs(size),
+                    'open_price': open_price,
+                    'close_close': price,
+                    'pnl': raw_pnl
+                })
+            self.active_trade = {
+                'open_time': self.current_tick,
+                'open_price': price,
+                'size': new_pos
+            }
+
+    # -------------------------------------------------
+    #               PERFORMANCE PLOTTING
+    # -------------------------------------------------
+    def plotPerformance(self):
+        """
+        We'll create 3 sub-charts:
+          (A) PnL + Mid
+          (B) Position + Mid
+          (C) Spread & Mid + signals + Overlaid shading for each trade's open->close:
+             green if PnL>0, red if PnL<0, plus a text label with the numeric PnL
+        """
+        # Flatten if still open
+        pos_now = self.positions.get(self.product, 0)
+        if pos_now != 0 and self.active_trade is not None:
+            last_mid = self.mid_history[-1]
+            qty_close = -pos_now
+            label = 'close(long)' if pos_now>0 else 'close(short)'
+            self._recordTrade(qty_close, last_mid, label)
+
+        final_pnl = self.pnl_history[-1]
+        stats_str = self._compute_metrics(final_pnl)
+        print("\n" + "="*60)
+        print("FINAL PERFORMANCE METRICS (Rolling-window approach) + Overlaid trade outcome shading + labels")
+        print(stats_str)
+        print("="*60 + "\n")
+
+        # Convert PnL history to a DataFrame
+        df_perf = pd.DataFrame({'Timestamp': self.timestamp_history,
+                                'PnL': self.pnl_history
+                               }).set_index('Timestamp')
+
+        # (A) PnL + Mid
+        fig, ax1 = plt.subplots(figsize=(10,5))
+        ax1.plot(df_perf.index, df_perf['PnL'], color='blue', label='PnL')
+        ax1.set_xlabel('Tick')
+        ax1.set_ylabel('PnL', color='blue')
+        ax1.tick_params(axis='y', labelcolor='blue')
+
+        ax2 = ax1.twinx()
+        ax2.plot(self.timestamp_history, self.mid_history, color='orange', linestyle='--', label='Mid Price')
+        ax2.set_ylabel('Mid Price', color='orange')
+        ax2.tick_params(axis='y', labelcolor='orange')
+
+        plt.title("PnL + Mid Price (Rolling-window average logic)")
+        ln1, lb1 = ax1.get_legend_handles_labels()
+        ln2, lb2 = ax2.get_legend_handles_labels()
+        ax2.legend(ln1+ln2, lb1+lb2, loc='best')
+        plt.show()
+
+        # (B) Position + Mid
+        fig, ax1 = plt.subplots(figsize=(10,4))
+        ax1.plot(self.timestamp_history, self.position_history, color='green', label='Position')
+        ax1.set_xlabel('Tick')
+        ax1.set_ylabel('Position', color='green')
+        ax1.tick_params(axis='y', labelcolor='green')
+
+        ax2 = ax1.twinx()
+        ax2.plot(self.timestamp_history, self.mid_history, color='orange', linestyle='--', label='Mid Price')
+        ax2.set_ylabel('Mid Price', color='orange')
+        ax2.tick_params(axis='y', labelcolor='orange')
+
+        plt.title("Position Over Time + Mid Price Overlay")
+        ln1, lb1 = ax1.get_legend_handles_labels()
+        ln2, lb2 = ax2.get_legend_handles_labels()
+        ax2.legend(ln1+ln2, lb1+lb2, loc='best')
+        plt.show()
+
+        # (C) Spread & Mid + signals + Overlaid shading for trades
+        fig, ax1 = plt.subplots(figsize=(10,4))
+        ax1.plot(self.timestamp_history, self.spread[self.product], label='Spread', color='blue')
+        ax1.set_xlabel('Tick')
+        ax1.set_ylabel('Spread', color='blue')
+        ax1.tick_params(axis='y', labelcolor='blue')
+
+        ax2 = ax1.twinx()
+        ax2.plot(self.timestamp_history, self.mid_history, color='orange', linestyle='--', label='Mid Price')
+        ax2.set_ylabel('Mid Price', color='orange')
+        ax2.tick_params(axis='y', labelcolor='orange')
+
+        buy_ticks  = [t for (t,sig) in self.order_signals[self.product] if 'buy' in sig]
+        sell_ticks = [t for (t,sig) in self.order_signals[self.product] if 'sell' in sig]
+        close_ticks= [t for (t,sig) in self.order_signals[self.product] if 'close' in sig]
+
+        buy_prices   = [self.mid_history[i] for i,x in enumerate(self.timestamp_history) if x in buy_ticks]
+        sell_prices  = [self.mid_history[i] for i,x in enumerate(self.timestamp_history) if x in sell_ticks]
+        close_prices = [self.mid_history[i] for i,x in enumerate(self.timestamp_history) if x in close_ticks]
+
+        ax2.scatter(buy_ticks,  buy_prices,   marker='^', color='green',  s=80, label='Buy')
+        ax2.scatter(sell_ticks, sell_prices, marker='v', color='red',    s=80, label='Sell')
+        ax2.scatter(close_ticks,close_prices,marker='o', color='black',  s=80, label='Close')
+
+        # Overlaid shading for each completed trade in trade_history
+        usedProfitLabel = False
+        usedLossLabel   = False
+        times = np.array(self.timestamp_history)
+        n = len(times)
+
+        for trade in self.trade_history:
+            ot = trade['open_time']
+            ct = trade['close_time']
+            if ct < ot:
+                continue
+            trade_pnl = trade['pnl']
+            color = 'green' if trade_pnl > 0 else 'red'
+            if trade_pnl > 0 and not usedProfitLabel:
+                ax2.axvspan(ot, ct, color=color, alpha=0.2, label='Profitable Trade')
+                usedProfitLabel = True
+            elif trade_pnl <= 0 and not usedLossLabel:
+                ax2.axvspan(ot, ct, color=color, alpha=0.2, label='Losing Trade')
+                usedLossLabel = True
+            else:
+                ax2.axvspan(ot, ct, color=color, alpha=0.2)
+
+            # Now we also label the numeric PnL in the middle of that region
+            x_mid = 0.5*(ot + ct)  # approximate midpoint in time
+            # We'll find the index i in self.timestamp_history that's closest to x_mid
+            # so we can anchor text near the mid price there
+            i_closest = np.searchsorted(times, x_mid)
+            if i_closest >= n:
+                i_closest = n-1
+            # We'll place the text near mid_history[i_closest]
+            y_text = self.mid_history[i_closest]
+            if trade_pnl > 0:
+                y_text += 0.02*y_text  # small upward offset
+            else:
+                y_text -= 0.02*y_text  # small downward offset
+
+            trade_pnl_str = f"{trade_pnl:+.2f}" 
+            ax2.text(x_mid, y_text, trade_pnl_str, color='black',
+                     ha='center', va='center', fontsize=9,
+                     bbox=dict(facecolor='white', alpha=0.5, edgecolor='none'))
+
+        # Combine legends
+        h1, l1 = ax1.get_legend_handles_labels()
+        h2, l2 = ax2.get_legend_handles_labels()
+        ax2.legend(h1+h2, l1+l2, loc='best')
+
+        plt.title("Spread & Mid Price w/ Signals + Trade Outcome Shading + PnL Labels")
+        plt.show()
+
+    def _compute_metrics(self, final_pnl: float) -> str:
+        """Compute final PnL, trade stats, Sharpe, Sortino, etc."""
+        total_pnl = final_pnl
+        trade_pnls = [t['pnl'] for t in self.trade_history]
+        n_trades = len(trade_pnls)
+        if n_trades>0:
+            avg_trade = np.mean(trade_pnls)
+            med_trade = np.median(trade_pnls)
+            std_trade = np.std(trade_pnls, ddof=1)
+            best_trade= np.max(trade_pnls)
+            worst_trade= np.min(trade_pnls)
+        else:
+            avg_trade=med_trade=std_trade=best_trade=worst_trade=0.0
+
+        wins = [p for p in trade_pnls if p>0]
+        win_rate = (len(wins)/n_trades)*100 if n_trades>0 else 0.0
+
+        times = np.array(self.timestamp_history)
+        if len(times)>1:
+            total_ticks = times[-1] - times[0]
+        else:
+            total_ticks=1
+        trade_freq = (n_trades / total_ticks) if total_ticks>0 else 0.0
+
+        eq = np.array(self.pnl_history)
+
+        rets = np.diff(eq)
+        if len(rets)>1 and np.std(rets, ddof=1)>0:
+            mean_rets = np.mean(rets)
+            std_rets  = np.std(rets, ddof=1)
+            raw_sharpe = mean_rets / std_rets
+            sharpe = raw_sharpe * np.sqrt(50000)
+        else:
+            sharpe=0.0
+
+        sortino = compute_sortino_ratio(rets)
+        volatility = np.std(rets, ddof=1) if len(rets)>1 else 0.0
+
+        gains  = sum(p for p in trade_pnls if p>0)
+        losses = sum(-p for p in trade_pnls if p<0)
+        if losses==0:
+            profit_factor = float('inf') if gains>0 else 1.0
+        else:
+            profit_factor = gains / losses
+
+        lines = [
+            f"Total PnL = {total_pnl:.2f}",
+            f"PnL/Trade => Avg={avg_trade:.2f}, Median={med_trade:.2f}, Std={std_trade:.2f}, Best={best_trade:.2f}, Worst={worst_trade:.2f}",
+            f"Win Rate = {win_rate:.2f}%",
+            f"Trade Frequency = {trade_freq:.3f} trades/tick",
+            f"Sharpe Ratio (ann. 50k) = {sharpe:.3f}",
+            f"Sortino Ratio = {sortino:.3f}",
+            f"Volatility of Returns = {volatility:.3f}",
+            f"Profit Factor = {profit_factor:.3f}"
+        ]
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------
+team_algorithm = TradingAlgorithm()
+
+def getOrders(current_data, positions):
+    """
+    Called each tick by the backtester.
+    We'll only operate on 'UEC_expanded'.
+    This code also overlays PnL labels in the third subplot for each trade's open->close.
+    """
+    team_algorithm.positions = positions
+    order_data = {p: 0 for p in current_data}
+    return team_algorithm.getOrders(current_data, order_data)
